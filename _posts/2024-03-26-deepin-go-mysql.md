@@ -77,13 +77,13 @@ pos++
 
 对于这一点，我是比较疑惑的，后来翻看了一下alibaba canal的相同代码，没有发现前4位有什么特殊的地方：
 
-![请在此添加图片描述](https://developer.qcloudimg.com/http-save/yehe-5459079/aed97d8fae10ffe59f338a07a67f13bf.png?qc_blockWidth=784&qc_blockHeight=472)
+![请在此添加图片描述](img/in-post/2024-03-26/img-1.png)
 
 不过后来我发现MariaDB里有这样一个文档：
 
 [https://mariadb.com/kb/en/com\_register\_slave/](https://mariadb.com/kb/en/com_register_slave/)
 
-![请在此添加图片描述](https://developer.qcloudimg.com/http-save/yehe-5459079/7bcacc52118dcddf34a0ff5993d6466d.png?qc_blockWidth=784&qc_blockHeight=474)
+![请在此添加图片描述](img/in-post/2024-03-26/img-2.png)
 
 也就是说，前4位可能是一个类似于魔法数一样的东西。
 
@@ -95,13 +95,13 @@ pos++
 
 这个报文有官方文档可以看，还是比较友好的：
 
-![请在此添加图片描述](https://developer.qcloudimg.com/http-save/yehe-5459079/5f3bd03ce685f66559a3cf9f5329977b.png?qc_blockWidth=784&qc_blockHeight=226)
+![请在此添加图片描述](img/in-post/2024-03-26/img-3.png)
 
 这个报文基本都是定长数据，只有filename这一个变长数据。
 
 但是，go-mysql里的cmd也是从位置4开始写的。还是从MariaDB处得到答案：
 
-![请在此添加图片描述](https://developer.qcloudimg.com/http-save/yehe-5459079/22bdfb863a6028876d7b8758f2f9835c.png?qc_blockWidth=784&qc_blockHeight=240)
+![请在此添加图片描述](img/in-post/2024-03-26/img-4.png)
 
 可见，前面4位确实是一类类似魔数的东西。
 
@@ -109,11 +109,11 @@ pos++
 
 那么这个Header有什么呢？还是在alibaba的canal里找到了答案：
 
-![请在此添加图片描述](https://developer.qcloudimg.com/http-save/yehe-5459079/ae81780a2ebae0974ac0385e8cd69898.png?qc_blockWidth=784&qc_blockHeight=298)
+![请在此添加图片描述](img/in-post/2024-03-26/img-5.png)
 
 也就是前三位保存body的长度（小端序），第4位保存一个序列号，这个序列号在拼body的数据时候就已经置为0了，在alibaba canal里也是一样的处理方式：
 
-![请在此添加图片描述](https://developer.qcloudimg.com/http-save/yehe-5459079/02f6d110285c617d641eaafce58a9aab.png?qc_blockWidth=784&qc_blockHeight=222)
+![请在此添加图片描述](img/in-post/2024-03-26/img-6.png)
 
 ### 1.3 COM\_BINLOG\_DUMP\_GTID
 
