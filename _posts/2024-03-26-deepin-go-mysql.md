@@ -4,7 +4,7 @@ title:      【深入go-mysql源码】Slave的注册和流开启
 subtitle:   Slave的注册和流开启
 date:       2024-03-26
 author:     Lyonzhi
-header-img: 2024-03-26/deepin-go-mysql-bg.jpg
+header-img: img/in-post/2024-03-26/deepin-go-mysql-bg.jpg
 catalog: true
 tags:
     - golang
