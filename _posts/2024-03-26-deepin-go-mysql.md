@@ -83,7 +83,7 @@ pos++
 
 [https://mariadb.com/kb/en/com\_register\_slave/](https://mariadb.com/kb/en/com_register_slave/)
 
-![请在此添加图片描述](../img/in-post/2024-03-26/img-2.png)
+![请在此添加图片描述](../../img/in-post/2024-03-26/img-2.png)
 
 也就是说，前4位可能是一个类似于魔法数一样的东西。
 
