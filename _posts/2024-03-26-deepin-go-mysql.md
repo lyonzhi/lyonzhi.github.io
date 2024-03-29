@@ -22,6 +22,18 @@ tags:
 
 如果可能的话，顺手就连[alibaba canal](https://github.com/alibaba/canal)一起学了。
 
+MySQL的复制技术是一个非常好用的技术，很容易就能搭建一个集群出来，再配合各种中间件，可以方便的搭建出一个读写分离负载均衡的集群。
+
+MySQL的复制技术也经历了多年的发展，据我自己的工作经验来看，使用异步复制技术和半同步复制技术就能满足大部分系统的实际需求。
+
+下面的图是一个到处都能搜到的图，来自MySQL官方，很好的说明了各类复制技术的基本原理：
+
+![异步复制](../../../../img/in-post/2024-03-26/async-replication-diagram.png)
+
+![半同步复制](../../../../img/in-post/2024-03-26/semisync-replication-diagram.png)
+
+要理解MySQL的复制技术，首先就要去探究binlog技术。binlog是复制的基础，而且是和引擎没有关系的，这是Server层的日志。
+
 ## 1. Binlog各类报文
 
 首先考虑这样一个问题：我们要如何得到MySQL的Binlog，像Slave一样？
@@ -371,3 +383,150 @@ if sequence != c.Sequence {
 - 0,0,0,0,4就是event最开始的5位，表示timestamp=0和type=4，也就是ROTATE_EVENT
 
 了解了如何去分析一个binlog event的网络包之后，就可以开始分析binlog event了。
+
+### 3.3 ROTATE_EVENT事件的解析
+
+先看一个典型的binlog文件（binlog.000050）最后一个事件记录，它一定是这样的一种形式：
+
+| Log_name      | Pos | Event_type     | Server_id | End_log_pos | Info|
+|--|--|--|--|--|--|
+|binlog.000050|708|Rotate|1|752|binlog.000051;pos=4|
+
+这个事件指明了下一个事件的文件名和起始位置。这也是我们能解析到的第一个事件，一段时间以来我一直以为这是binlog记录的第一个事件。
+
+除去common header部分不看，那么这个事件可以整理如下表：
+
+|byte|description|
+|--|--|
+|8|下一个binlog文件第一个位置，一般都是4，我也没见过别的值|
+|n|下一个binlog的文件名，长度不定|
+
+这个事件很简单，没什么多余需要说的。写一段伪代码去解析这个event：
+
+```go
+// 截取掉common header部分
+event := data[19:]
+// 读取8个字节的position
+position := littleEndian.Uint64(event[0:])
+// index=8之后就是fileName部分
+fileName := event[8:]
+```
+
+这样就完成了事件的解析。接下来就可以继续解析下面的事件了。
+
+### 3.4 FORMAT_DESCRIPTION_EVENT事件的解析
+
+事件编码：15
+
+这个事件就一定是binlog的第一个事件了：
+
+| Log_name      | Pos | Event_type     | Server_id | End_log_pos | Info|
+|--|--|--|--|--|--|
+| binlog.000050 |   4 | Format_desc    |         1 |         126 | Server ver: 8.0.32, Binlog ver: 4                                   |
+
+这里能看到的信息似乎不多，就是一些基本的信息，比如Server的版本、binlog的版本。
+
+现在解析一下binlog文件来看看这个事件都有哪些信息：
+
+```
+# at 4
+#240329 19:20:25 server id 1  end_log_pos 126 CRC32 0x6364c980 	Start: binlog v 4, server v 8.0.32 created 240329 19:20:25
+# Warning: this binlog is either in use or was not closed properly.
+```
+
+这个事件看起来平平无奇，不过是很重要的一个事件，因为这里记录了如何decode后面的binlog事件的相关信息。
+
+在解析这个事件之前，先来看看MySQL都提供了哪些校验方法：
+
+- BINLOG_CHECKSUM_ALG_OFF: 0x00
+- BINLOG_CHECKSUM_ALG_CRC32: 0x01
+- BINLOG_CHECKSUM_ALG_UNDEF: 0xFF
+
+先用`select @@global.binlog_checksum`命令查询一下，我的MySQL用什么算法去做binlog的checksum，一般结果都是CRC32。
+
+这个事件整理如下表：
+
+|byte|description|
+|--|--|
+|2|Version，就是binlog里看到的4|
+|50|server version，也就是8.0.32，但是后面还有一串编码|
+|4|时间戳|
+|1|EventHeaderLength，就是19，这里可以做一个校验，如果不是19直接报错即可|
+|n|这部分从57开始到len-5结束，不需要关注，也不知道是什么|
+|1|校验算法枚举，例如1|
+|n|不明|
+
+这一事件的解析决定了以后的事件解析，所以有些校验是必须要做的。
+
+我查阅了go-mysql和canal的代码以后，发现了有几个项目是一定要去校验的：
+
+- commonHeaderLen：这个值的校验两者有些不同，还是看兼容性，在现代版本的MySQL里，这个值一定是19，所以我倾向于直接校验其是否等于19，如果不等就可以结束流程了；
+- checksumVersionProduct，这个的校验略显复杂，直接贴代码
+
+```go
+checksumVersionSplitMysql   = []int{5, 6, 1}
+checksumVersionProductMysql = (checksumVersionSplitMysql[0]*256+checksumVersionSplitMysql[1])*256 + checksumVersionSplitMysql[2]
+```
+
+MariaDB略有不同：
+
+```go
+checksumVersionSplitMariaDB   = []int{5, 3, 0}
+checksumVersionProductMariaDB = (checksumVersionSplitMariaDB[0]*256+checksumVersionSplitMariaDB[1])*256 + checksumVersionSplitMariaDB[2]
+```
+
+也就是说，如果binlog里记录的版本是大于5.6.1的，就可以通过校验，否则就会失败。对于MariaDB而言，版本号需要大于5.3.0。从做项目的角度来说，应该在产品手册里明确写上不支持5.6.1以下版本的MySQL。
+
+在得到了校验算法类型之后，后面的时间在parse的时候，就需要首先完成verify。
+
+这里有一个有趣的issue：[10.1.22-MariaDB版本数据库 journalName乱码](https://github.com/alibaba/canal/issues/1081)
+
+我们在生产环境中也遇到过，就是在解析binlog name的时候，莫名奇妙的出现了一些乱码，导致解析失败。这就是由于开源工程的复杂性导致的。
+
+MariaDB和MySQL不同，在ROTATE_EVENT里就采用了checksum逻辑，所以文件名之后那一堆乱码就是checksum。
+
+### 3.5 PREVIOUS_GTIDS_LOG_EVENT事件的解析
+
+这是binlog的第二个事件。这个事件更是平平无奇，平平无奇到canal里连解析都没有：
+
+```java
+public class PreviousGtidsLogEvent extends LogEvent {
+
+    public PreviousGtidsLogEvent(LogHeader header, LogBuffer buffer, FormatDescriptionLogEvent descriptionEvent){
+        super(header);
+        // do nothing , just for mysql gtid search function
+    }
+}
+```
+
+不过go-mysql还是给了解析的逻辑，一遍让我来一探究竟。为了简单期间，我假定的gtid是这样的，也就是只有一组UUID：
+
+```uuid
+3d687a2c-b38e-11ed-91ef-3f952e283fc3:1-278
+```
+
+|byte|description|
+|--|--|
+|8|uuid count，也就是有几组UUID|
+|16|uuid|
+|8|sliceCount，也就是有几组范围，比如1-3:11:47-49就有3组，这里假定一组|
+|8|startPos，比如上面的1|
+|8|endPos，比如上面的3|
+
+在实际的生产过程中，我们也没有使用过这个事件来做什么，从canal的代码来看，这个事件的作用也确实不大。
+
+到这里，我就分析完了所有binlog的头三板斧。
+
+### 3.6 QUERY_EVENT事件的解析
+
+### 3.7 GTID_EVENT事件的解析
+
+### 3.8 TABLE_MAP_EVENT事件的解析
+
+### 3.9 WRITE_ROWS_EVENTv2事件的解析
+
+### 3.10 XID_EVENT事件的解析
+
+### 3.11 DELETE_ROWS_EVENTv2事件的解析
+
+### 3.12 UPDATE_ROWS_EVENTv2事件的解析
