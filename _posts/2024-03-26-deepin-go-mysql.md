@@ -519,9 +519,233 @@ public class PreviousGtidsLogEvent extends LogEvent {
 
 ### 3.6 QUERY_EVENT事件的解析
 
-### 3.7 GTID_EVENT事件的解析
+我个人认为这个Event的名字没有很好的做到见名知意。从其名称来看，似乎是各类`select`之类的查询事件，但实际上却是一类DDL的集合，比如`CreateTableStatement`、`AlterTableStatemt`。
+
+按照惯例，要分析这个Event就要知道这个Event的结构：
+
+|byte|description|
+|--|--|
+|4|sessionId，分配给这个statement的id，uint32|
+|4|execTime，该查询消耗的时间，uint32|
+|1|schemaLength，uint8|
+|2|errorCodem，uint16|
+|2|status variables的长度，v1，v3没有这个参数，uint16|
+|n|status variables|
+|n|default schema name|
+|n|SQL 语句|
+
+如果是MariaDB，在处理SQL语句的时候，需要注意`compress`参数，如果开启了就需要特殊处理。这个可以参考canal的一个issue：[支持下mysql 8.0/maraidb 10.x下的binlog压缩解析能力](https://github.com/alibaba/canal/issues/4388)。
+
+这里没有一个地方标识查询的种类的，比如`CreateTableStatment`，所以，在完成Event的解析后，SQL就显得非常重要。需要引入一个解析器来，将SQL解析成对应的类型。
+
+读代码到这里就会意识到，如果要做事件的解析和后续的工作，就需要自己实现一套模型，这套模型里需要一些满足工作需要的参数。比如QUERY_EVENT，就需要引入一个`Type`参数，标记具体的Query类型。
+
+这个以后再详细描述。
+
+### 3.7 GTID_LOG_EVENT事件的解析
+
+这里需要区分一下一些长相相似的孪生兄弟事件：
+
+- GTID_EVENT：编号162，事实上从160开始的就是MariaDB的事件了，这里先按下不表，有机会研究
+- GTID_LOG_EVENT：这才是在`show binlog events`命令里看到的Gtid事件，编号33
+
+这个事件的组成如下表：
+
+|byte|description|
+|--|--|
+|1|commit flag, 布尔型，保存为uint8|
+|16|sid，就是一个uuid|
+|8|gno，long64型|
+|1|logic timestamp type code，保存为uint8。以下属于可选类型|
+|8|lastCommitted，保存为long64|
+|8|sequenceNumber，保存为long64|
+|7|immediate commit timestamp，定长|
+|7|original commit timestamp，定长|
+|n|transaction length|
+|4|immediate server version|
+
+实际上，canal只分析解析到了sequence number，后面的内容就都忽略掉了。可能这部分的内容对数据的获取没有什么影响。
+
+作为学习，还是需要查查这些内容究竟是什么。
+
+MySQL有一种延迟复制机制，这种能力对DBA来说很实用，比如可以设置一个延迟复制的Slave，作为一个快照，在Master误删数据之后可以补救。
+
+所以，如果设置了延迟复制，那么就会有两个可度量的参数，这两个参数在MySQL8以后才提供：
+
+- immediate_commit_timestamp：将事务写入（提交）到从库的二进制日志的时间戳
+- original_commit_timestamp：将事务写入（提交）到主库二进制日志之后的时间戳
+
+来看一个实例：
+
+```text
+# at 1297
+#240329 23:53:51 server id 1  end_log_pos 1376 CRC32 0x65b589b5 	GTID	last_committed=4	sequence_number=5	rbr_only=yes	original_committed_timestamp=1711727631039014	immediate_commit_timestamp=1711727631039014	transaction_length=316
+/*!50718 SET TRANSACTION ISOLATION LEVEL READ COMMITTED*//*!*/;
+# original_commit_timestamp=1711727631039014 (2024-03-29 23:53:51.039014 CST)
+# immediate_commit_timestamp=1711727631039014 (2024-03-29 23:53:51.039014 CST)
+/*!80001 SET @@session.original_commit_timestamp=1711727631039014*//*!*/;
+/*!80014 SET @@session.original_server_version=80032*//*!*/;
+/*!80014 SET @@session.immediate_server_version=80032*//*!*/;
+SET @@SESSION.GTID_NEXT= '3d687a2c-b38e-11ed-91ef-3f952e283fc3:283'/*!*/;
+```
+
+我的例子里，这两个时间戳就没有区别，这是因为我的库是个主库，主库里这个数据永远相同。所以canal不去处理这两个参数就可以理解了，拿到的数据是主库的，也就没有解析的必要了。
+
+可以查阅参考文献1。
+
+后面的事务大小，我个人觉得也没有太多的解析的必要，作为一个拉取binlog并去做数据同步的组件，这些信息就足够了。
+
+这就回到了事件本身能带给我们的意义了，GTID_LOG_EVENT主要能提供给我们的信息就是GTID本身。
 
 ### 3.8 TABLE_MAP_EVENT事件的解析
+
+这是一个TABLE_MAP_EVENT的binlog记录：
+
+```text
+# at 981
+#240402 19:29:29 server id 1  end_log_pos 1064 CRC32 0xa0606671 	Table_map: `sbtest`.`xa_record5` mapped to number 111
+# has_generated_invisible_primary_key=0
+# Columns(`id` INT NOT NULL,
+#         `uname` VARCHAR(10) CHARSET utf8mb4 COLLATE utf8mb4_0900_ai_ci)
+# Primary Key(id)
+# at 1064
+```
+
+就这么一点点内容，但是极端重要。为了说明其重要，我们需要去看看TABLE_MAP_EVENT之后紧紧跟随的Write_Rows事件：
+
+```text
+# at 925
+#240329 23:52:40 server id 1  end_log_pos 969 CRC32 0x5f836017 	Delete_rows: table id 111 flags: STMT_END_F
+### DELETE FROM `sbtest`.`xa_record5`
+### WHERE
+###   @1=1 /* INT meta=0 nullable=0 is_null=0 */
+###   @2='bar' /* VARSTRING(40) meta=40 nullable=1 is_null=0 */
+```
+
+对于执行回放任务的SQL线程来说，这里的"@1"和"@2"就谜语一样无法下手。
+
+所以，在row格式的binlog里，每一个有关数据的DML操作，都一定会有一个TABLE_MAP_EVENT去将这个表定义映射成一个数字。
+
+这个数字就是之前看到的111。以我现在的理解，这个111是MySQL内部给表的编号，可以利用这个编号查询到表的DDL。
+
+也能推出一个结论：
+
+> row格式下的binlog，dml是由TABLE_MAP_EVENT和ROW_LOG_EVENT两个事件组成。
+
+这个table_id是一个很重要的数字，但是却无从查找，因为这个数字是不定的，而且保存在内存里。
+
+现在来分析分析这个事件的构成。先看Post-header部分：
+
+|byte|description|
+|--|--|
+|6|table_id,6 bytes unsined integer|
+|2|flags, 2bytes，现阶段永远是0|
+
+接下来就可以开始解析event里最丰富的信息了，换一种表格：
+
+|name|format|description|
+|--|--|--|
+|database_name_length|1byte|数据库名称长度，有时候叫schema name|
+|database_name|n|数据库名称|
+|termination|1|终止符，固定的，解析的时候一定注意跳过|
+|table_name_length|1byte|表名的长度|
+|table_name|n|表名|
+|termination|1|终止符，固定的，解析的时候一定注意跳过|
+|column count|packet length|column数量，注意，这里是一个封装起来的长度，如何解析可以参考资料2|
+|column type|n|长度取决于column count|
+|meta data|n|列的元数据|
+|null bits|n|是否为null标记|
+|optional|n|这部分比较复杂，下面会仔细解析|
+
+从之前的分析可以得知，想要将ROW_LOG_EVENT里记录的数据变更变成可执行的SQL，那至少需要知道表结构。
+
+基本的table_name和database_name可以用下面的伪代码来解析：
+
+```go
+pos = 0
+tableId = buffer.uint48()
+pos += 6
+// 或者直接给0，并将pos+2
+flags = buffer.uint16()
+pos += 2
+databaseNameLength = buffer.uint8()
+pos++
+// golang的切片这里是两个index，所以end index加上了pos
+databaseName = buffer[pos:pos+databaseNameLength]
+pos += databaseNameLength
+
+// 跳过终止符
+pos++
+
+tableNameLength = buffer.uint8()
+pos++
+
+tableName = buffer[pos:pos+tableNameLength]
+pos += tableNameLength
+
+// 跳过终止符
+pos++
+```
+
+到这里，简单的信息我都解析出来了，其中的tableId现在来说没什么用。
+
+更复杂的就是Column的解析。假定我们已经解析出来columnCnt，接下来就可以解析columnType：
+
+```go
+columnType = data[pos, pos+columnCnt]
+pos += columnCnt
+```
+
+到这里，go-mysql和canal就有了设计上的区别了。go-mysql只是简单的将columnType以byte数组的形式保存到了struct里，而canal则直接开始解析byte数组，并将解析结果保存到ColumnInfo类中。作为对事件的理解需要，摘录这段解析代码：
+
+```java
+columnInfo = new ColumnInfo[columnCnt];
+for (int i = 0; i < columnCnt; i++) {
+    ColumnInfo info = new ColumnInfo();
+    info.type = buffer.getUint8();
+    columnInfo[i] = info;
+}
+```
+
+虽然columnType本身作为byte数组的长度是不定的，但是内部每一个column的type确实固定的1个byte，用`uint8()`就能取出。
+
+此时，复杂性逐渐就出来了。这个type解析出来仅仅是一个int数据而已，但是它决定了后面的meta应该如何读取。来看看官方对meta的描述，能略知一二：
+
+> For each column from left to right, a chunk of data who's length and semantics depends on the type of the column. The length and semantics for the metadata for each column are listed in the table below.
+
+明确的说了，meta是depends on column type的。
+
+不管是canal还是go-mysql，在解析完type之后，就可以开始解析meta了，比较复杂，所以官方给了一个表格，参见文献3。
+
+举个例子可以加深理解，比如常见的decimal(m,n)，这个类型的identifier是246，名称是MYSQL_TYPE_NEWDECIMAL，注意不要和MYSQL_TYPE_DECIMAL混淆。
+
+这个类型的meta长度是2byte：
+
+```java
+int x = buffer.getUint8() << 8; // precision
+x += buffer.getUint8(); // decimals
+```
+
+完成meta的解析以后，我们可以得到的信息就相当完整了，有database-table的全部信息和column的大部分信息。
+
+nullable的属性也和columnCnt有关，解析代码如下：
+
+```go
+nullBitmapSize := bitmapByteSize(int(e.ColumnCount))
+if len(data[pos:]) < nullBitmapSize {
+    return io.EOF
+}
+
+e.NullBitmap = data[pos : pos+nullBitmapSize]
+
+pos += nullBitmapSize
+```
+
+`bitmapByteSize`是`int((column_count + 7) / 8)`，可以参考文献3的说明。
+
+由于我的目的不是将MySQL的数据转换为MySQL，所以我对后面的charset等都不是很感兴趣，所以option的信息就先不分析如何解析了。
+
+所以这个Event完成分析以后，我们就能得到一个完整的数据表DDL信息了。接下来只要知道数据，就可以将这些信息拼成一个可用的SQL了。
 
 ### 3.9 WRITE_ROWS_EVENTv2事件的解析
 
@@ -530,3 +754,9 @@ public class PreviousGtidsLogEvent extends LogEvent {
 ### 3.11 DELETE_ROWS_EVENTv2事件的解析
 
 ### 3.12 UPDATE_ROWS_EVENTv2事件的解析
+
+## 参考文献
+
+[1. replication-delayed](https://dev.mysql.com/doc/refman/8.3/en/replication-delayed.html)
+[2. getPackedLong](https://github.com/alibaba/canal/blob/master/dbsync/src/main/java/com/taobao/tddl/dbsync/binlog/LogBuffer.java#L1088)
+[3. Table__map__even](https://dev.mysql.com/doc/dev/mysql-server/8.0.34/classbinary__log_1_1Table__map__event.html)
